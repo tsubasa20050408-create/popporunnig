@@ -1,15 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar,
-  ResponsiveContainer,
+  ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
 } from "recharts";
 import {
   Activity, Trophy, Target, Gauge, Flame, Mountain, TrendingDown,
   Heart, RefreshCw, Link2, Plus, RotateCcw, ChevronRight,
+  Settings, Trash2, Download, Upload, Calendar, Dumbbell, HeartPulse, Pencil, X,
 } from "lucide-react";
 import {
   WORKOUTS, SEED_STATS, SEED_LOGS, SEED_MISSIONS,
   calcXP, levelFromXP, rankTitle, applyGains, fmtPace, classify,
+  recomputeStats, evaluateMissions, weekRange, hrZones, weeklyFocus, STRENGTH_PLAN,
+  initialState,
 } from "../lib/training.js";
 import { paceSet, vdotFromRace, SUB3_VDOT, VDOT_MIN, VDOT_MAX } from "../lib/vdot.js";
 import { parseActivityFile } from "../lib/parseActivity.js";
@@ -50,9 +53,9 @@ export default function TrainingApp() {
     (async () => {
       try {
         const s = await fetch("/api/state").then((r) => r.json());
-        setState(s);
+        setState(s && s.logs ? s : initialState());
       } catch {
-        setState(null);
+        setState(initialState()); // API未到達でもシードで開けるように
       }
       const params = new URLSearchParams(window.location.search);
       if (params.get("strava") === "connected") {
@@ -176,6 +179,17 @@ export default function TrainingApp() {
     );
   }
 
+  // ── 全mutationの中心：logs/missions/maxHR から xp・stats・ミッション自動判定を再計算 ──
+  function withRecalc(base) {
+    const logs = (base.logs || []).map((l) => ({ ...l, xp: calcXP(l, base.maxHR || 198) }));
+    const missions = evaluateMissions(base.missions || [], logs);
+    const stats = recomputeStats(logs, missions);
+    return { ...base, logs, missions, stats };
+  }
+  function commit(base) {
+    saveState(withRecalc(base));
+  }
+
   // ── アクション ──
   function addLog(form) {
     const log = {
@@ -190,13 +204,7 @@ export default function TrainingApp() {
       descent: 0,
       note: form.note || "",
     };
-    log.xp = calcXP(log, state.maxHR || 198);
-    const next = {
-      ...state,
-      logs: [log, ...state.logs],
-      stats: applyGains(state.stats, log.type, log.dur),
-    };
-    saveState(next);
+    commit({ ...state, logs: [log, ...state.logs] });
     setTab("status");
   }
 
@@ -252,7 +260,7 @@ export default function TrainingApp() {
 
   // items: [{ name, text }] — ファイル選択・スマホ共有・ZIP展開の共通取込。{added, skipped} を返す
   function importItems(parsed) {
-    let next = { ...state, logs: [...state.logs], stats: { ...state.stats } };
+    const logs = [...state.logs];
     let added = 0, skipped = 0;
     for (const item of parsed) {
       if (!item) continue;
@@ -260,54 +268,77 @@ export default function TrainingApp() {
       try { act = parseActivityFile(item.name, item.text); } catch { act = null; }
       if (!act || !act.dist || !act.dur) { skipped++; continue; }
       // 重複ガード：同じ日付かつ距離がほぼ同じなら取り込まない
-      if (next.logs.some((l) => l.date === act.date && Math.abs((l.dist || 0) - act.dist) < 0.05)) {
+      if (logs.some((l) => l.date === act.date && Math.abs((l.dist || 0) - act.dist) < 0.05)) {
         skipped++; continue;
       }
       const type = classify({ type: "Run", workout_type: 0, total_elevation_gain: act.gain }, act.dist, act.dur);
-      const log = {
+      logs.unshift({
         id: "f_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
         date: act.date, type, dist: act.dist, dur: act.dur,
         avgHR: act.avgHR, maxHR: act.maxHR, gain: act.gain, descent: 0,
         note: (act.name || item.name) + "（ファイル取込）",
-      };
-      log.xp = calcXP(log, state.maxHR || 198);
-      next.logs = [log, ...next.logs];
-      next.stats = applyGains(next.stats, type, log.dur);
+      });
       added++;
     }
-    saveState(next);
-    if (added) setTab("status");
+    if (added) { commit({ ...state, logs }); setTab("status"); }
     return { added, skipped };
   }
 
   function changeLogType(id, type) {
-    const next = {
+    commit({ ...state, logs: state.logs.map((l) => (l.id === id ? { ...l, type } : l)) });
+  }
+
+  function editLog(id, patch) {
+    commit({
       ...state,
       logs: state.logs.map((l) =>
-        l.id === id ? { ...l, type, xp: calcXP({ ...l, type }, state.maxHR || 198) } : l
+        l.id === id
+          ? { ...l, ...patch, dist: +patch.dist || 0, dur: +patch.dur || 0, gain: +patch.gain || 0, avgHR: +patch.avgHR || 0, maxHR: +patch.maxHR || 0 }
+          : l
       ),
-    };
-    saveState(next);
+    });
   }
 
+  function deleteLog(id) {
+    if (!window.confirm("この記録を削除しますか？")) return;
+    commit({ ...state, logs: state.logs.filter((l) => l.id !== id) });
+  }
+
+  // カスタムミッションのみ手動トグル（既定m1〜m5はログから自動判定）
   function toggleMission(id) {
-    const next = {
-      ...state,
-      stats: { ...state.stats },
-      missions: state.missions.map((m) => {
-        if (m.id !== id) return m;
-        const done = !m.done;
-        const delta = (done ? 1 : -1) * (m.inc || 0);
-        const cur = state.stats[m.attr] ?? 0;
-        next.stats = { ...next.stats, [m.attr]: Math.max(0, Math.min(100, +(cur + delta).toFixed(1))) };
-        return { ...m, done };
-      }),
-    };
-    saveState(next);
+    commit({ ...state, missions: state.missions.map((m) => (m.id === id ? { ...m, done: !m.done } : m)) });
   }
 
-  function resetMissions() {
-    saveState({ ...state, missions: state.missions.map((m) => ({ ...m, done: false })) });
+  function reEvaluate() {
+    commit({ ...state }); // withRecalc が evaluateMissions を実行
+  }
+
+  function addMission(m) {
+    const mission = {
+      id: "c_" + Date.now(),
+      label: m.label || "カスタムミッション",
+      attr: m.attr || "aerobic",
+      inc: +m.inc || 2,
+      bonus: +m.bonus || 100,
+      done: false,
+      custom: true,
+    };
+    commit({ ...state, missions: [...state.missions, mission] });
+  }
+
+  function removeMission(id) {
+    commit({ ...state, missions: state.missions.filter((m) => m.id !== id) });
+  }
+
+  function updateSettings(patch) {
+    const next = { ...state, ...patch };
+    if (patch.maxHR != null) next.maxHR = Math.max(120, Math.min(230, +patch.maxHR || 198));
+    if (patch.vdot != null) next.vdot = Math.max(VDOT_MIN, Math.min(VDOT_MAX, Math.round(+patch.vdot)));
+    commit(next); // maxHR変更時はxp・statsも再計算される
+  }
+
+  function updateVdot(v) {
+    saveState({ ...state, vdot: Math.max(VDOT_MIN, Math.min(VDOT_MAX, Math.round(v)) ) });
   }
 
   function resetAll() {
@@ -315,14 +346,32 @@ export default function TrainingApp() {
     saveState({
       maxHR: 198,
       vdot: 50,
+      raceName: "北海道マラソン", raceDate: "",
       logs: SEED_LOGS.map((l) => ({ ...l, xp: calcXP(l, l.maxHR || 198) })),
       stats: { ...SEED_STATS },
       missions: SEED_MISSIONS.map((m) => ({ ...m })),
     });
   }
 
-  function updateVdot(v) {
-    saveState({ ...state, vdot: Math.max(VDOT_MIN, Math.min(VDOT_MAX, Math.round(v))) });
+  function exportBackup() {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `poppo-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function importBackup(file) {
+    try {
+      const data = JSON.parse(await file.text());
+      if (!data || !Array.isArray(data.logs)) throw new Error("invalid");
+      commit({ maxHR: 198, vdot: 50, raceName: "北海道マラソン", raceDate: "", missions: [], ...data });
+      setBanner({ kind: "ok", text: "バックアップを復元しました。" });
+    } catch {
+      setBanner({ kind: "err", text: "バックアップの読み込みに失敗しました（JSON形式を確認）。" });
+    }
   }
 
   return (
@@ -334,14 +383,23 @@ export default function TrainingApp() {
             <h1 className="text-xl font-black tracking-tight">POPPO TRAINING LOG</h1>
             <p className="text-xs text-white/50">{rankTitle(totals.level)} ・ サブ3への道</p>
           </div>
-          <button
-            onClick={autoSync}
-            disabled={syncing}
-            className={`${btn} border border-white/10 bg-white/5 flex items-center gap-1`}
-          >
-            <RefreshCw className={`w-4 h-4 ${syncing ? "animate-spin" : ""}`} />
-            {syncing ? "同期中" : "同期"}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={autoSync}
+              disabled={syncing}
+              className={`${btn} border border-white/10 bg-white/5 flex items-center gap-1`}
+            >
+              <RefreshCw className={`w-4 h-4 ${syncing ? "animate-spin" : ""}`} />
+              {syncing ? "同期中" : "同期"}
+            </button>
+            <button
+              onClick={() => setTab(tab === "settings" ? "status" : "settings")}
+              className={`${btn} border border-white/10 ${tab === "settings" ? "bg-emerald-500/20 text-emerald-300" : "bg-white/5"}`}
+              aria-label="設定"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+          </div>
         </header>
 
         {banner && (
@@ -356,11 +414,22 @@ export default function TrainingApp() {
 
         {tab === "status" && <StatusTab state={state} totals={totals} />}
         {tab === "log" && <LogTab onAdd={addLog} onImport={importFiles} />}
-        {tab === "history" && <HistoryTab state={state} onChangeType={changeLogType} />}
+        {tab === "history" && (
+          <HistoryTab state={state} onChangeType={changeLogType} onEdit={editLog} onDelete={deleteLog} />
+        )}
         {tab === "missions" && (
-          <MissionsTab state={state} onToggle={toggleMission} onReset={resetMissions} onResetAll={resetAll} />
+          <MissionsTab
+            state={state}
+            onToggle={toggleMission}
+            onReEvaluate={reEvaluate}
+            onAddMission={addMission}
+            onRemoveMission={removeMission}
+          />
         )}
         {tab === "pace" && <PaceTab state={state} onUpdateVdot={updateVdot} />}
+        {tab === "settings" && (
+          <SettingsTab state={state} onUpdate={updateSettings} onExport={exportBackup} onImport={importBackup} onResetAll={resetAll} />
+        )}
       </div>
 
       {/* 下部ナビ */}
@@ -387,11 +456,44 @@ export default function TrainingApp() {
   );
 }
 
+// 日付文字列(YYYY-MM-DD)の週始まり(月曜)を返す
+function mondayOf(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  if (isNaN(d)) return dateStr;
+  const day = (d.getDay() + 6) % 7;
+  d.setDate(d.getDate() - day);
+  return d.toISOString().slice(0, 10);
+}
+
 // ── ステータス（RPG）──
 function StatusTab({ state, totals }) {
   const radarData = ATTRS.map((a) => ({ attr: a.short, value: state.stats[a.key] ?? 0 }));
   const pct = Math.min(100, Math.round((totals.into / totals.req) * 100));
   const connected = (state.logs || []).some((l) => String(l.id).startsWith("st_"));
+
+  // レースまでの日数
+  const daysToRace = useMemo(() => {
+    if (!state.raceDate) return null;
+    const ms = new Date(state.raceDate + "T00:00:00") - new Date(new Date().toISOString().slice(0, 10) + "T00:00:00");
+    return Math.round(ms / 86400000);
+  }, [state.raceDate]);
+
+  // 週間距離（直近10週）と 週間XP
+  const trend = useMemo(() => {
+    const byWeek = {};
+    for (const l of state.logs || []) {
+      if (!l.date) continue;
+      const wk = mondayOf(l.date);
+      if (!byWeek[wk]) byWeek[wk] = { week: wk, km: 0, xp: 0 };
+      byWeek[wk].km += l.dist || 0;
+      byWeek[wk].xp += l.xp || 0;
+    }
+    const weeks = Object.values(byWeek).sort((a, b) => a.week.localeCompare(b.week));
+    const last = weeks.slice(-10).map((w) => ({ ...w, km: +w.km.toFixed(1), label: w.week.slice(5) }));
+    let cum = 0;
+    const cumXP = weeks.map((w) => { cum += w.xp; return { label: w.week.slice(5), xp: cum }; }).slice(-12);
+    return { weekly: last, cumXP, thisWeekKm: (byWeek[mondayOf(new Date().toISOString().slice(0, 10))]?.km || 0) };
+  }, [state.logs]);
 
   return (
     <div className="space-y-4">
@@ -418,6 +520,25 @@ function StatusTab({ state, totals }) {
           </div>
         </div>
       </div>
+
+      {/* レースカウントダウン */}
+      {state.raceDate && (
+        <div className={`${card} flex items-center justify-between`}>
+          <div className="flex items-center gap-2">
+            <Calendar className="h-4 w-4 text-cyan-400" />
+            <div>
+              <p className="text-sm font-medium">{state.raceName || "目標レース"}</p>
+              <p className="text-[11px] text-white/50">{state.raceDate}</p>
+            </div>
+          </div>
+          <div className="text-right">
+            <p className="text-2xl font-black leading-none text-cyan-400">
+              {daysToRace >= 0 ? daysToRace : "—"}
+            </p>
+            <p className="text-[11px] text-white/50">{daysToRace >= 0 ? "日前" : "終了"}</p>
+          </div>
+        </div>
+      )}
 
       {/* Strava連携 */}
       <div className={card}>
@@ -466,6 +587,44 @@ function StatusTab({ state, totals }) {
               </span>
             </div>
           ))}
+        </div>
+      </div>
+
+      {/* 推移グラフ */}
+      <div className={card}>
+        <div className="flex items-center justify-between">
+          <p className="text-sm font-medium">週間距離</p>
+          <p className="text-[11px] text-white/50">今週 {trend.thisWeekKm.toFixed(1)}km</p>
+        </div>
+        <div className="mt-2 h-40">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={trend.weekly} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" vertical={false} />
+              <XAxis dataKey="label" tick={{ fill: "rgba(255,255,255,0.5)", fontSize: 10 }} />
+              <YAxis tick={{ fill: "rgba(255,255,255,0.5)", fontSize: 10 }} />
+              <Tooltip
+                contentStyle={{ background: "#11161f", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, fontSize: 12 }}
+                labelStyle={{ color: "#fff" }} cursor={{ fill: "rgba(255,255,255,0.05)" }}
+                formatter={(v) => [`${v}km`, "距離"]}
+              />
+              <Bar dataKey="km" fill="#34d399" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+        <p className="mt-3 mb-1 text-sm font-medium">累計XP推移</p>
+        <div className="h-32">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={trend.cumXP} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" vertical={false} />
+              <XAxis dataKey="label" tick={{ fill: "rgba(255,255,255,0.5)", fontSize: 10 }} />
+              <YAxis tick={{ fill: "rgba(255,255,255,0.5)", fontSize: 10 }} />
+              <Tooltip
+                contentStyle={{ background: "#11161f", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, fontSize: 12 }}
+                labelStyle={{ color: "#fff" }} formatter={(v) => [v.toLocaleString(), "累計XP"]}
+              />
+              <Line type="monotone" dataKey="xp" stroke="#22d3ee" strokeWidth={2} dot={false} />
+            </LineChart>
+          </ResponsiveContainer>
         </div>
       </div>
     </div>
@@ -556,24 +715,31 @@ function Field({ label, children }) {
   );
 }
 
-// ── 履歴（種別の手動修正つき）──
-function HistoryTab({ state, onChangeType }) {
+// ── 履歴（種別修正・編集・削除）──
+function HistoryTab({ state, onChangeType, onEdit, onDelete }) {
   const logs = state.logs || [];
+  const [editId, setEditId] = useState(null);
   return (
     <div className="space-y-3">
       {logs.length === 0 && <div className={`${card} text-center text-sm text-white/50`}>記録がありません</div>}
-      {logs.map((l) => {
-        const w = WORKOUTS[l.type];
-        const fromStrava = String(l.id).startsWith("st_");
-        return (
+      {logs.map((l) =>
+        editId === l.id ? (
+          <LogEditor
+            key={l.id}
+            log={l}
+            onCancel={() => setEditId(null)}
+            onSave={(patch) => { onEdit(l.id, patch); setEditId(null); }}
+          />
+        ) : (
           <div key={l.id} className={card}>
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <div className="flex items-center gap-2 text-xs text-white/50">
                   <span>{l.date}</span>
-                  {fromStrava && <span className="rounded bg-orange-500/20 px-1.5 py-0.5 text-orange-300">Strava</span>}
+                  {String(l.id).startsWith("st_") && <span className="rounded bg-orange-500/20 px-1.5 py-0.5 text-orange-300">Strava</span>}
+                  {String(l.id).startsWith("f_") && <span className="rounded bg-cyan-500/20 px-1.5 py-0.5 text-cyan-300">ファイル</span>}
                 </div>
-                <p className="mt-0.5 truncate text-sm font-medium">{l.note || w?.label}</p>
+                <p className="mt-0.5 truncate text-sm font-medium">{l.note || WORKOUTS[l.type]?.label}</p>
               </div>
               <span className="shrink-0 text-sm font-bold text-emerald-400">+{l.xp || 0}XP</span>
             </div>
@@ -586,7 +752,6 @@ function HistoryTab({ state, onChangeType }) {
             </div>
 
             <div className="mt-2 flex items-center gap-2">
-              <span className="text-[11px] text-white/40">種別</span>
               <select
                 className="flex-1 rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-xs outline-none focus:border-emerald-400/60"
                 value={l.type}
@@ -596,10 +761,43 @@ function HistoryTab({ state, onChangeType }) {
                   <option key={k} value={k}>{WORKOUTS[k].label}</option>
                 ))}
               </select>
+              <button onClick={() => setEditId(l.id)} className={`${btn} border border-white/10 bg-white/5 px-2.5 py-1.5`} aria-label="編集">
+                <Pencil className="h-3.5 w-3.5" />
+              </button>
+              <button onClick={() => onDelete(l.id)} className={`${btn} border border-rose-500/30 text-rose-300 px-2.5 py-1.5`} aria-label="削除">
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
             </div>
           </div>
-        );
-      })}
+        )
+      )}
+    </div>
+  );
+}
+
+function LogEditor({ log, onSave, onCancel }) {
+  const [f, setF] = useState({
+    date: log.date || "", dist: log.dist ?? "", dur: log.dur ?? "",
+    gain: log.gain ?? "", avgHR: log.avgHR ?? "", maxHR: log.maxHR ?? "", note: log.note || "",
+  });
+  const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
+  const input = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-emerald-400/60";
+  return (
+    <div className={`${card} border-emerald-400/30`}>
+      <p className="mb-2 text-sm font-medium">記録を編集</p>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="日付"><input type="date" className={input} value={f.date} onChange={set("date")} /></Field>
+        <Field label="距離 (km)"><input type="number" inputMode="decimal" className={input} value={f.dist} onChange={set("dist")} /></Field>
+        <Field label="時間 (分)"><input type="number" inputMode="decimal" className={input} value={f.dur} onChange={set("dur")} /></Field>
+        <Field label="獲得標高 (m)"><input type="number" inputMode="numeric" className={input} value={f.gain} onChange={set("gain")} /></Field>
+        <Field label="平均HR"><input type="number" inputMode="numeric" className={input} value={f.avgHR} onChange={set("avgHR")} /></Field>
+        <Field label="最大HR"><input type="number" inputMode="numeric" className={input} value={f.maxHR} onChange={set("maxHR")} /></Field>
+      </div>
+      <Field label="メモ"><input className={input} value={f.note} onChange={set("note")} /></Field>
+      <div className="mt-3 flex gap-2">
+        <button onClick={() => onSave(f)} className={`${btn} flex-1 bg-emerald-500 text-black hover:bg-emerald-400`}>保存</button>
+        <button onClick={onCancel} className={`${btn} border border-white/10 bg-white/5`}>キャンセル</button>
+      </div>
     </div>
   );
 }
@@ -613,10 +811,44 @@ function Cell({ k, v }) {
   );
 }
 
-// ── ミッション ──
-function MissionsTab({ state, onToggle, onReset, onResetAll }) {
+// ── ミッション（既定は今週のログから自動判定 / カスタムは手動）──
+function MissionsTab({ state, onToggle, onReEvaluate, onAddMission, onRemoveMission }) {
   const missions = state.missions || [];
+  const presets = missions.filter((m) => !m.custom);
+  const customs = missions.filter((m) => m.custom);
   const doneCount = missions.filter((m) => m.done).length;
+  const [adding, setAdding] = useState(false);
+  const [form, setForm] = useState({ label: "", attr: "aerobic", inc: 2, bonus: 100 });
+  const input = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-emerald-400/60";
+
+  const Row = ({ m, auto }) => {
+    const a = ATTRS.find((x) => x.key === m.attr);
+    return (
+      <div className={`${card} flex w-full items-center justify-between ${m.done ? "border-emerald-400/40 bg-emerald-500/[0.07]" : ""}`}>
+        <button
+          onClick={() => !auto && onToggle(m.id)}
+          disabled={auto}
+          className="flex flex-1 items-center gap-3 text-left disabled:cursor-default"
+        >
+          <span className={`flex h-6 w-6 items-center justify-center rounded-full border ${m.done ? "border-emerald-400 bg-emerald-400 text-black" : "border-white/20"}`}>
+            {m.done && "✓"}
+          </span>
+          <div>
+            <p className={`text-sm ${m.done ? "text-white/60 line-through" : ""}`}>{m.label}</p>
+            <p className="text-[11px]" style={{ color: a?.color }}>
+              {a?.label} +{m.inc} ・ ボーナス +{m.bonus}XP{auto ? " ・ 自動判定" : ""}
+            </p>
+          </div>
+        </button>
+        {m.custom && (
+          <button onClick={() => onRemoveMission(m.id)} className="ml-2 text-rose-300/70 hover:text-rose-300" aria-label="削除">
+            <X className="h-4 w-4" />
+          </button>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-3">
       <div className={`${card} flex items-center justify-between`}>
@@ -624,42 +856,63 @@ function MissionsTab({ state, onToggle, onReset, onResetAll }) {
           <p className="text-sm font-medium">今週のミッション</p>
           <p className="text-xs text-white/50">{doneCount} / {missions.length} 達成</p>
         </div>
-        <button onClick={onReset} className={`${btn} border border-white/10 bg-white/5 flex items-center gap-1`}>
-          <RotateCcw className="h-3.5 w-3.5" /> リセット
+        <button onClick={onReEvaluate} className={`${btn} border border-white/10 bg-white/5 flex items-center gap-1`}>
+          <RotateCcw className="h-3.5 w-3.5" /> 再判定
         </button>
       </div>
 
-      {missions.map((m) => {
-        const a = ATTRS.find((x) => x.key === m.attr);
-        return (
-          <button
-            key={m.id}
-            onClick={() => onToggle(m.id)}
-            className={`${card} flex w-full items-center justify-between text-left ${m.done ? "border-emerald-400/40 bg-emerald-500/[0.07]" : ""}`}
-          >
-            <div className="flex items-center gap-3">
-              <span
-                className={`flex h-6 w-6 items-center justify-center rounded-full border ${
-                  m.done ? "border-emerald-400 bg-emerald-400 text-black" : "border-white/20"
-                }`}
-              >
-                {m.done && "✓"}
-              </span>
-              <div>
-                <p className={`text-sm ${m.done ? "text-white/60 line-through" : ""}`}>{m.label}</p>
-                <p className="text-[11px]" style={{ color: a?.color }}>
-                  {a?.label} +{m.inc} ・ ボーナス +{m.bonus}XP
-                </p>
-              </div>
-            </div>
-            <ChevronRight className="h-4 w-4 text-white/30" />
-          </button>
-        );
-      })}
+      <p className="px-1 text-[11px] text-white/40">既定ミッションは今週のログから自動で達成判定されます。</p>
+      {presets.map((m) => <Row key={m.id} m={m} auto />)}
 
-      <button onClick={onResetAll} className={`${btn} w-full border border-rose-500/30 text-rose-300 hover:bg-rose-500/10`}>
-        すべてのデータを初期化
-      </button>
+      {customs.length > 0 && <p className="px-1 pt-1 text-[11px] text-white/40">カスタムミッション（タップで達成切替）</p>}
+      {customs.map((m) => <Row key={m.id} m={m} auto={false} />)}
+
+      {/* カスタムミッション追加 */}
+      {adding ? (
+        <div className={`${card} space-y-3`}>
+          <Field label="内容"><input className={input} value={form.label} onChange={(e) => setForm((f) => ({ ...f, label: e.target.value }))} placeholder="例: ウィンドスプリント 6本" /></Field>
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <label className="mb-1 block text-[11px] text-white/50">能力</label>
+              <select className={input} value={form.attr} onChange={(e) => setForm((f) => ({ ...f, attr: e.target.value }))}>
+                {ATTRS.map((a) => <option key={a.key} value={a.key}>{a.label}</option>)}
+              </select>
+            </div>
+            <Field label="能力+"><input type="number" className={input} value={form.inc} onChange={(e) => setForm((f) => ({ ...f, inc: e.target.value }))} /></Field>
+            <Field label="XP"><input type="number" className={input} value={form.bonus} onChange={(e) => setForm((f) => ({ ...f, bonus: e.target.value }))} /></Field>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => { if (form.label.trim()) { onAddMission(form); setForm({ label: "", attr: "aerobic", inc: 2, bonus: 100 }); setAdding(false); } }}
+              className={`${btn} flex-1 bg-emerald-500 text-black hover:bg-emerald-400`}
+            >追加</button>
+            <button onClick={() => setAdding(false)} className={`${btn} border border-white/10 bg-white/5`}>やめる</button>
+          </div>
+        </div>
+      ) : (
+        <button onClick={() => setAdding(true)} className={`${btn} w-full border border-white/10 bg-white/5 flex items-center justify-center gap-1`}>
+          <Plus className="h-4 w-4" /> ミッションを追加
+        </button>
+      )}
+
+      {/* 補強メニュー提案 */}
+      <div className={card}>
+        <div className="mb-2 flex items-center gap-2">
+          <Dumbbell className="h-4 w-4 text-amber-400" />
+          <p className="text-sm font-medium">補強メニュー提案（ウェイト/クロス）</p>
+        </div>
+        <p className="mb-2 text-[11px] text-white/40">弱点（登坂/下り）と故障予防に。記録は種別「筋トレ / クロス」で残すとXPになります。</p>
+        <div className="space-y-2">
+          {STRENGTH_PLAN.map((g) => (
+            <div key={g.group} className="rounded-xl bg-white/[0.03] px-3 py-2">
+              <p className="text-xs font-medium text-amber-300">{g.group}</p>
+              <ul className="mt-1 space-y-0.5">
+                {g.items.map((it) => <li key={it} className="text-[11px] text-white/70">・{it}</li>)}
+              </ul>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -719,6 +972,32 @@ function PaceTab({ state, onUpdateVdot }) {
         <p className="mt-2 text-[10px] text-white/40">現VDOTでのレース予想タイム（公式換算表より）</p>
       </div>
 
+      {/* 今週の練習方針（VDOT差から） */}
+      {(() => {
+        const plan = weeklyFocus(gap);
+        let days = null;
+        if (state.raceDate) {
+          const ms = new Date(state.raceDate + "T00:00:00") - new Date(new Date().toISOString().slice(0, 10) + "T00:00:00");
+          days = Math.round(ms / 86400000);
+        }
+        return (
+          <div className={card}>
+            <div className="flex items-center gap-2">
+              <Target className="h-4 w-4 text-emerald-400" />
+              <p className="text-sm font-medium">今週の練習方針</p>
+            </div>
+            {days != null && days >= 0 && (
+              <p className="mt-1 text-[11px] text-cyan-300">{state.raceName || "目標レース"}まで あと{days}日</p>
+            )}
+            <p className="mt-2 text-sm font-bold text-emerald-300">{plan.focus}</p>
+            <p className="mt-1 text-[11px] text-white/60">{plan.detail}</p>
+            <p className="mt-2 text-[10px] text-white/40">
+              {gap > 0 ? `サブ3まで VDOT あと${gap.toFixed(0)}` : "サブ3ライン到達。仕上げフェーズ。"}
+            </p>
+          </div>
+        );
+      })()}
+
       {/* 練習ペース表 */}
       <div className={card}>
         <p className="mb-2 text-sm font-medium">練習ペース（/km）</p>
@@ -766,6 +1045,26 @@ function PaceTab({ state, onUpdateVdot }) {
           ※ 利尻53km等のウルトラは超低強度でVDOT算出に不向きです。直近の5km〜ハーフ、またはTT（タイムトライアル）で更新してください。デフォルトはVDOT50。
         </p>
       </div>
+
+      {/* 心拍ゾーン */}
+      <div className={card}>
+        <div className="mb-2 flex items-center gap-2">
+          <HeartPulse className="h-4 w-4 text-rose-400" />
+          <p className="text-sm font-medium">心拍ゾーン（最大HR {state.maxHR} 基準）</p>
+        </div>
+        <div className="space-y-1.5">
+          {hrZones(state.maxHR || 198).map((z) => (
+            <div key={z.z} className="flex items-center gap-3 rounded-xl bg-white/[0.03] px-3 py-2">
+              <span className="flex h-7 w-9 shrink-0 items-center justify-center rounded-lg bg-rose-500/15 text-xs font-black text-rose-300">
+                {z.z}
+              </span>
+              <span className="flex-1 text-xs text-white/80">{z.name}</span>
+              <span className="shrink-0 font-mono text-sm font-bold tabular-nums">{z.loB}–{z.hiB}</span>
+            </div>
+          ))}
+        </div>
+        <p className="mt-2 text-[10px] text-white/40">最大HRは設定（右上⚙）で変更できます。Eペース=Z2、Mペース=Z3、Tペース=Z4が目安。</p>
+      </div>
     </div>
   );
 }
@@ -775,6 +1074,65 @@ function RaceCell({ k, v }) {
     <div className="rounded-lg bg-white/[0.03] py-1.5">
       <div className="text-[10px] text-white/40">{k}</div>
       <div className="font-mono font-bold tabular-nums text-white/90">{v}</div>
+    </div>
+  );
+}
+
+// ── 設定 ──
+function SettingsTab({ state, onUpdate, onExport, onImport, onResetAll }) {
+  const [f, setF] = useState({
+    maxHR: state.maxHR ?? 198,
+    vdot: state.vdot ?? 50,
+    raceName: state.raceName ?? "",
+    raceDate: state.raceDate ?? "",
+  });
+  const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
+  const input = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-emerald-400/60";
+
+  return (
+    <div className="space-y-4">
+      <div className={card}>
+        <p className="mb-3 text-sm font-medium">基本設定</p>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="最大心拍 (maxHR)"><input type="number" inputMode="numeric" className={input} value={f.maxHR} onChange={set("maxHR")} /></Field>
+          <Field label="VDOT"><input type="number" inputMode="numeric" className={input} value={f.vdot} onChange={set("vdot")} /></Field>
+          <Field label="目標レース名"><input className={input} value={f.raceName} onChange={set("raceName")} placeholder="北海道マラソン" /></Field>
+          <Field label="レース日"><input type="date" className={input} value={f.raceDate} onChange={set("raceDate")} /></Field>
+        </div>
+        <button
+          onClick={() => onUpdate({ maxHR: f.maxHR, vdot: f.vdot, raceName: f.raceName, raceDate: f.raceDate })}
+          className={`${btn} mt-3 w-full bg-emerald-500 text-black hover:bg-emerald-400`}
+        >
+          設定を保存
+        </button>
+        <p className="mt-2 text-[10px] text-white/40">最大心拍を変えると全記録のXP・能力値が再計算されます。</p>
+      </div>
+
+      <div className={card}>
+        <p className="mb-1 text-sm font-medium">バックアップ</p>
+        <p className="mb-3 text-[11px] text-white/40">データはUpstashに保存されますが、JSONで手元にも保存できます（保険・端末移行用）。</p>
+        <div className="flex gap-2">
+          <button onClick={onExport} className={`${btn} flex-1 border border-white/10 bg-white/5 flex items-center justify-center gap-1`}>
+            <Download className="h-4 w-4" /> 書き出し
+          </button>
+          <label className={`${btn} flex-1 cursor-pointer border border-white/10 bg-white/5 flex items-center justify-center gap-1`}>
+            <Upload className="h-4 w-4" /> 復元
+            <input
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={(e) => { if (e.target.files[0]) onImport(e.target.files[0]); e.target.value = ""; }}
+            />
+          </label>
+        </div>
+      </div>
+
+      <div className={card}>
+        <p className="mb-3 text-sm font-medium text-rose-300">危険な操作</p>
+        <button onClick={onResetAll} className={`${btn} w-full border border-rose-500/30 text-rose-300 hover:bg-rose-500/10`}>
+          すべてのデータを初期化
+        </button>
+      </div>
     </div>
   );
 }
