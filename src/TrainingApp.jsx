@@ -13,6 +13,7 @@ import {
 } from "../lib/training.js";
 import { paceSet, vdotFromRace, SUB3_VDOT, VDOT_MIN, VDOT_MAX } from "../lib/vdot.js";
 import { parseActivityFile } from "../lib/parseActivity.js";
+import { unzip, gunzipText } from "../lib/unzip.js";
 
 // ── UI専用の能力値メタ（ロジックには影響しない）──
 const ATTRS = [
@@ -96,7 +97,13 @@ export default function TrainingApp() {
   // state読込後に共有ファイルを取込
   useEffect(() => {
     if (state && pendingShare && pendingShare.length) {
-      importItems(pendingShare);
+      const { added, skipped } = importItems(pendingShare);
+      setBanner({
+        kind: added ? "ok" : "err",
+        text: added
+          ? `共有から${added}件を取り込みました${skipped ? `（${skipped}件はスキップ）` : ""}。`
+          : "共有ファイルを取り込めませんでした（重複/解析失敗）。",
+      });
       setPendingShare(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -193,17 +200,57 @@ export default function TrainingApp() {
     setTab("status");
   }
 
-  // ── GPX/TCXファイル取込（Strava API不要・完全無料）──
+  // ── GPX/TCX/ZIP/gz ファイル取込（Strava API不要・完全無料）──
+  // ZIP(=Strava一括エクスポート)やgzは展開し、中のGPX/TCXをまとめて取り込む。
   async function importFiles(fileList) {
     const files = [...fileList];
     if (!files.length) return;
-    const parsed = await Promise.all(
-      files.map((f) => f.text().then((text) => ({ name: f.name, text })).catch(() => null))
-    );
-    importItems(parsed);
+    const items = [];
+    let fitCount = 0;
+    const pushIfActivity = (name, text) => {
+      const n = name.toLowerCase();
+      if (n.endsWith(".gpx") || n.endsWith(".tcx")) items.push({ name, text });
+    };
+    for (const f of files) {
+      const lower = f.name.toLowerCase();
+      try {
+        if (lower.endsWith(".zip")) {
+          const entries = await unzip(await f.arrayBuffer());
+          for (const e of entries) {
+            const en = e.name.toLowerCase();
+            if (en.endsWith(".fit") || en.endsWith(".fit.gz")) { fitCount++; continue; }
+            if (en.endsWith(".gz")) {
+              const text = await gunzipText(e.bytes);
+              pushIfActivity(e.name.replace(/\.gz$/i, ""), text);
+            } else {
+              pushIfActivity(e.name, new TextDecoder().decode(e.bytes));
+            }
+          }
+        } else if (lower.endsWith(".gz")) {
+          const base = f.name.replace(/\.gz$/i, "");
+          if (base.toLowerCase().endsWith(".fit")) { fitCount++; continue; }
+          pushIfActivity(base, await gunzipText(new Uint8Array(await f.arrayBuffer())));
+        } else if (lower.endsWith(".fit")) {
+          fitCount++;
+        } else {
+          pushIfActivity(f.name, await f.text());
+        }
+      } catch {
+        /* 壊れたファイルはスキップ */
+      }
+    }
+    const { added, skipped } = importItems(items);
+    setBanner({
+      kind: added ? "ok" : "err",
+      text: added
+        ? `${added}件を取り込みました${skipped ? `（${skipped}件はスキップ）` : ""}。${fitCount ? ` FIT形式${fitCount}件は未対応のため除外。` : ""}`
+        : fitCount
+          ? `FIT形式が${fitCount}件ありました（現在未対応）。Stravaの「GPXをエクスポート」で取得したGPX、または一括ZIP内のGPX/TCXを使ってください。`
+          : "取り込めるアクティビティがありませんでした（重複/解析失敗）。",
+    });
   }
 
-  // items: [{ name, text }] — ファイル選択・スマホ共有の共通取込
+  // items: [{ name, text }] — ファイル選択・スマホ共有・ZIP展開の共通取込。{added, skipped} を返す
   function importItems(parsed) {
     let next = { ...state, logs: [...state.logs], stats: { ...state.stats } };
     let added = 0, skipped = 0;
@@ -229,13 +276,8 @@ export default function TrainingApp() {
       added++;
     }
     saveState(next);
-    setBanner({
-      kind: added ? "ok" : "err",
-      text: added
-        ? `${added}件を取り込みました${skipped ? `（${skipped}件はスキップ）` : ""}。`
-        : "取り込めるアクティビティがありませんでした（重複/解析失敗）。",
-    });
     if (added) setTab("status");
+    return { added, skipped };
   }
 
   function changeLogType(id, type) {
@@ -453,16 +495,16 @@ function LogTab({ onAdd, onImport }) {
       <div className={card}>
         <div className="flex items-center gap-2">
           <Link2 className="h-4 w-4 text-orange-400" />
-          <p className="text-sm font-medium">ファイルから取込（GPX / TCX）</p>
+          <p className="text-sm font-medium">ファイルから取込（GPX / TCX / ZIP）</p>
         </div>
         <p className="mt-1 text-[11px] text-white/40">
-          Stravaの各アクティビティ → … → 「GPXをエクスポート」で保存したファイルを選ぶと、距離・時間・標高・心拍を自動計算してXPに反映します。複数選択OK。
+          GPX/TCX単体でも、Stravaの<b>一括エクスポートZIPを丸ごと</b>選んでもOK。中身を自動展開して距離・時間・標高・心拍を計算しXPに反映します。重複は自動スキップ・複数選択可。
         </p>
         <label className={`${btn} mt-3 block w-full cursor-pointer bg-orange-500/90 text-center text-white hover:bg-orange-500`}>
-          ファイルを選んで取り込む
+          ファイル / ZIP を選んで取り込む
           <input
             type="file"
-            accept=".gpx,.tcx,application/gpx+xml,application/xml,text/xml"
+            accept=".gpx,.tcx,.zip,.gz,application/gpx+xml,application/xml,text/xml,application/zip,application/gzip"
             multiple
             className="hidden"
             onChange={(e) => { onImport(e.target.files); e.target.value = ""; }}

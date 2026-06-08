@@ -75,7 +75,15 @@ Strava の一括ダウンロード（設定 → アカウント → アーカイ
 仕組み: `public/manifest.webmanifest` の `share_target` と `public/sw.js`（Service Worker）が共有ファイルを受け取り、アプリが取込みます。
 ※ Web Share Target は Chromium系ブラウザ（Android）で動作。iOSは非対応。Huawei端末はブラウザにより可否が異なります（不可なら下のA/手入力を使用）。
 
-### C. 手入力
+### C. 一括ZIP取込 — 手数最小・無料
+1. strava.com → 設定 → マイアカウント → **「アカウントの一括エクスポート（アーカイブをリクエスト）」**
+2. メールで届くZIPを **そのまま**（解凍せず）アプリの **記録 → 「ファイル / ZIP を選んで取り込む」** で選択
+3. ZIP内の `activities/*.gpx`（`.gz`圧縮も可）を自動展開して一括取込・重複自動スキップ
+
+`lib/unzip.js`（ブラウザ標準 `DecompressionStream` 使用・依存ゼロ）でZIP/gzを展開します。
+※ ZIP内が `.fit`（FIT形式）の場合は未対応。その活動は除外されます（個別の「GPXをエクスポート」なら必ずGPXで取得可）。
+
+### D. 手入力
 **記録** タブのフォームから直接入力。
 
 ### C. Strava API 自動連携（要・API利用権限）
