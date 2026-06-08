@@ -55,15 +55,26 @@ vercel --prod
 
 **重要**: 本番ドメインを `APP_URL` と Strava の Authorization Callback Domain の両方に一致させること（不一致だと OAuth 失敗）。
 
-## Phase 2（任意）: Strava Webhook で完全自動化
+## Strava Webhook で完全自動化（無料・自分専用）
 
-`api/strava/webhook.js` を実装済み。購読作成（1回）:
+アプリを開いていない時でも、ランが記録された瞬間に自動取込されます（Stravaの無料枠で利用可）。
 
-```bash
-curl -X POST https://www.strava.com/api/v3/push_subscriptions \
-  -F client_id=$STRAVA_CLIENT_ID -F client_secret=$STRAVA_CLIENT_SECRET \
-  -F callback_url=$APP_URL/api/strava/webhook -F verify_token=任意文字列
+実装済み:
+- `api/strava/webhook.js` — Strava からの通知を受信して同期
+- `api/strava/subscribe.js` — 購読をブラウザだけで管理（curl不要）
+
+環境変数に `STRAVA_VERIFY_TOKEN`（任意の文字列、例 `poppo`）を追加して再デプロイ後、ブラウザで開くだけ:
+
 ```
+購読状況の確認 : https://<your-domain>/api/strava/subscribe
+購読の作成     : https://<your-domain>/api/strava/subscribe?action=create
+購読の削除     : https://<your-domain>/api/strava/subscribe?action=delete&id=<購読ID>
+```
+
+`?action=create` を開いた瞬間に Strava が webhook を検証し、購読が有効になります。
+購読は1アプリにつき1つだけ。`{"result":{"id":...}}` が返れば成功です。
+
+開いている間も、アプリを再表示/フォーカスした時に自動同期します。
 
 ## 補足
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar,
   ResponsiveContainer,
@@ -64,6 +64,25 @@ export default function TrainingApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ── 再表示/フォーカス時にも自動同期（開きっぱなしでも最新に。Webサーバーは無料のまま）──
+  const autoSyncRef = useRef(() => {});
+  useEffect(() => {
+    let last = Date.now();
+    const maybeSync = () => {
+      // 連打/頻繁な発火を防ぐため60秒以上空いたときだけ
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - last < 60000) return;
+      last = Date.now();
+      autoSyncRef.current();
+    };
+    document.addEventListener("visibilitychange", maybeSync);
+    window.addEventListener("focus", maybeSync);
+    return () => {
+      document.removeEventListener("visibilitychange", maybeSync);
+      window.removeEventListener("focus", maybeSync);
+    };
+  }, []);
+
   async function saveState(next) {
     setState(next);
     try {
@@ -92,6 +111,7 @@ export default function TrainingApp() {
       setSyncing(false);
     }
   }
+  autoSyncRef.current = autoSync;
 
   // ── 集計（XP/レベル）──
   const totals = useMemo(() => {

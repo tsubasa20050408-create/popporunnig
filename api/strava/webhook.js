@@ -36,8 +36,15 @@ async function syncOne(activityId){
 
 export default async function handler(req, res){
   if(req.method === "GET"){
+    // Strava購読検証：mode=subscribe & verify_token一致なら challenge を返す
+    const mode = req.query["hub.mode"];
+    const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
-    return res.status(200).json({ "hub.challenge": challenge });
+    const expected = process.env.STRAVA_VERIFY_TOKEN || "poppo";
+    if(mode === "subscribe" && token === expected){
+      return res.status(200).json({ "hub.challenge": challenge });
+    }
+    return res.status(403).json({ error: "verify_failed" });
   }
   if(req.method === "POST"){
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
