@@ -67,7 +67,15 @@ Strava API が有料サブスクの裏に入った場合でも使える、**完�
 ブラウザ内で解析（`lib/parseActivity.js`）するためサーバー・API不要。過去のアクティビティもまとめて取り込めます。
 Strava の一括ダウンロード（設定 → アカウント → アーカイブをリクエスト）で得た元ファイルも利用できます。
 
-### B. 手入力
+### B. スマホの「共有」から直接取込（PWA Web Share Target）— 半自動・無料
+1. アプリをスマホで開き、ブラウザメニューから **「ホーム画面に追加 / アプリをインストール」**（PWA化）
+2. Strava や Huawei Health で対象アクティビティを **GPX/TCXで共有**
+3. 共有先の一覧に出る **「POPPO TRAINING LOG」** を選ぶ → 自動で取込・XP反映
+
+仕組み: `public/manifest.webmanifest` の `share_target` と `public/sw.js`（Service Worker）が共有ファイルを受け取り、アプリが取込みます。
+※ Web Share Target は Chromium系ブラウザ（Android）で動作。iOSは非対応。Huawei端末はブラウザにより可否が異なります（不可なら下のA/手入力を使用）。
+
+### C. 手入力
 **記録** タブのフォームから直接入力。
 
 ### C. Strava API 自動連携（要・API利用権限）

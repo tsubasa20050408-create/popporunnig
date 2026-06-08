@@ -42,6 +42,7 @@ export default function TrainingApp() {
   const [tab, setTab] = useState("status");
   const [syncing, setSyncing] = useState(false);
   const [banner, setBanner] = useState(null);
+  const [pendingShare, setPendingShare] = useState(null);
 
   // ── 起動：サーバーstate読込 + Strava自動同期 ──
   useEffect(() => {
@@ -64,6 +65,42 @@ export default function TrainingApp() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── スマホ共有メニューから来たファイルを Cache から取り出す（PWA Web Share Target）──
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("share-target") == null) return;
+    window.history.replaceState({}, "", window.location.pathname);
+    (async () => {
+      try {
+        if (!("caches" in window)) return;
+        const cache = await caches.open("shared-files");
+        const idx = await cache.match("/shared-index");
+        const keys = idx ? await idx.json() : [];
+        const items = [];
+        for (const k of keys) {
+          const r = await cache.match(k);
+          if (r) {
+            items.push({ name: r.headers.get("X-Filename") || "shared.gpx", text: await r.text() });
+            await cache.delete(k);
+          }
+        }
+        await cache.delete("/shared-index");
+        if (items.length) setPendingShare(items);
+      } catch {
+        /* 共有取込失敗時は無視 */
+      }
+    })();
+  }, []);
+
+  // state読込後に共有ファイルを取込
+  useEffect(() => {
+    if (state && pendingShare && pendingShare.length) {
+      importItems(pendingShare);
+      setPendingShare(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state, pendingShare]);
 
   // ── 再表示/フォーカス時にも自動同期（開きっぱなしでも最新に。Webサーバーは無料のまま）──
   const autoSyncRef = useRef(() => {});
@@ -163,6 +200,11 @@ export default function TrainingApp() {
     const parsed = await Promise.all(
       files.map((f) => f.text().then((text) => ({ name: f.name, text })).catch(() => null))
     );
+    importItems(parsed);
+  }
+
+  // items: [{ name, text }] — ファイル選択・スマホ共有の共通取込
+  function importItems(parsed) {
     let next = { ...state, logs: [...state.logs], stats: { ...state.stats } };
     let added = 0, skipped = 0;
     for (const item of parsed) {
