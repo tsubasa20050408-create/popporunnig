@@ -9,9 +9,10 @@ import {
 } from "lucide-react";
 import {
   WORKOUTS, SEED_STATS, SEED_LOGS, SEED_MISSIONS,
-  calcXP, levelFromXP, rankTitle, applyGains, fmtPace,
+  calcXP, levelFromXP, rankTitle, applyGains, fmtPace, classify,
 } from "../lib/training.js";
 import { paceSet, vdotFromRace, SUB3_VDOT, VDOT_MIN, VDOT_MAX } from "../lib/vdot.js";
+import { parseActivityFile } from "../lib/parseActivity.js";
 
 // ── UI専用の能力値メタ（ロジックには影響しない）──
 const ATTRS = [
@@ -155,6 +156,46 @@ export default function TrainingApp() {
     setTab("status");
   }
 
+  // ── GPX/TCXファイル取込（Strava API不要・完全無料）──
+  async function importFiles(fileList) {
+    const files = [...fileList];
+    if (!files.length) return;
+    const parsed = await Promise.all(
+      files.map((f) => f.text().then((text) => ({ name: f.name, text })).catch(() => null))
+    );
+    let next = { ...state, logs: [...state.logs], stats: { ...state.stats } };
+    let added = 0, skipped = 0;
+    for (const item of parsed) {
+      if (!item) continue;
+      let act = null;
+      try { act = parseActivityFile(item.name, item.text); } catch { act = null; }
+      if (!act || !act.dist || !act.dur) { skipped++; continue; }
+      // 重複ガード：同じ日付かつ距離がほぼ同じなら取り込まない
+      if (next.logs.some((l) => l.date === act.date && Math.abs((l.dist || 0) - act.dist) < 0.05)) {
+        skipped++; continue;
+      }
+      const type = classify({ type: "Run", workout_type: 0, total_elevation_gain: act.gain }, act.dist, act.dur);
+      const log = {
+        id: "f_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+        date: act.date, type, dist: act.dist, dur: act.dur,
+        avgHR: act.avgHR, maxHR: act.maxHR, gain: act.gain, descent: 0,
+        note: (act.name || item.name) + "（ファイル取込）",
+      };
+      log.xp = calcXP(log, state.maxHR || 198);
+      next.logs = [log, ...next.logs];
+      next.stats = applyGains(next.stats, type, log.dur);
+      added++;
+    }
+    saveState(next);
+    setBanner({
+      kind: added ? "ok" : "err",
+      text: added
+        ? `${added}件を取り込みました${skipped ? `（${skipped}件はスキップ）` : ""}。`
+        : "取り込めるアクティビティがありませんでした（重複/解析失敗）。",
+    });
+    if (added) setTab("status");
+  }
+
   function changeLogType(id, type) {
     const next = {
       ...state,
@@ -230,7 +271,7 @@ export default function TrainingApp() {
         )}
 
         {tab === "status" && <StatusTab state={state} totals={totals} />}
-        {tab === "log" && <LogTab onAdd={addLog} />}
+        {tab === "log" && <LogTab onAdd={addLog} onImport={importFiles} />}
         {tab === "history" && <HistoryTab state={state} onChangeType={changeLogType} />}
         {tab === "missions" && (
           <MissionsTab state={state} onToggle={toggleMission} onReset={resetMissions} onResetAll={resetAll} />
@@ -348,7 +389,7 @@ function StatusTab({ state, totals }) {
 }
 
 // ── 記録 ──
-function LogTab({ onAdd }) {
+function LogTab({ onAdd, onImport }) {
   const today = new Date().toISOString().slice(0, 10);
   const [form, setForm] = useState({
     date: today, type: "easy", dist: "", dur: "", avgHR: "", maxHR: "", gain: "", note: "",
@@ -366,8 +407,29 @@ function LogTab({ onAdd }) {
 
   return (
     <div className="space-y-4">
+      {/* ファイル取込（Strava API不要・無料）*/}
       <div className={card}>
-        <p className="mb-3 text-sm font-medium">トレーニングを記録</p>
+        <div className="flex items-center gap-2">
+          <Link2 className="h-4 w-4 text-orange-400" />
+          <p className="text-sm font-medium">ファイルから取込（GPX / TCX）</p>
+        </div>
+        <p className="mt-1 text-[11px] text-white/40">
+          Stravaの各アクティビティ → … → 「GPXをエクスポート」で保存したファイルを選ぶと、距離・時間・標高・心拍を自動計算してXPに反映します。複数選択OK。
+        </p>
+        <label className={`${btn} mt-3 block w-full cursor-pointer bg-orange-500/90 text-center text-white hover:bg-orange-500`}>
+          ファイルを選んで取り込む
+          <input
+            type="file"
+            accept=".gpx,.tcx,application/gpx+xml,application/xml,text/xml"
+            multiple
+            className="hidden"
+            onChange={(e) => { onImport(e.target.files); e.target.value = ""; }}
+          />
+        </label>
+      </div>
+
+      <div className={card}>
+        <p className="mb-3 text-sm font-medium">手入力で記録</p>
         <div className="space-y-3">
           <div>
             <label className="mb-1 block text-[11px] text-white/50">種別</label>
