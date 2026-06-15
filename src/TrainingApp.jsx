@@ -7,6 +7,7 @@ import {
   Activity, Trophy, Target, Gauge, Flame, Mountain, TrendingDown,
   Heart, RefreshCw, Link2, Plus, RotateCcw, ChevronRight,
   Settings, Trash2, Download, Upload, Calendar, Dumbbell, HeartPulse, Pencil, X,
+  BatteryCharging, Sparkles,
 } from "lucide-react";
 import {
   WORKOUTS, SEED_STATS, SEED_LOGS, SEED_MISSIONS,
@@ -14,9 +15,10 @@ import {
   recomputeStats, evaluateMissions, weekRange, hrZones, weeklyFocus, STRENGTH_PLAN,
   initialState,
 } from "../lib/training.js";
-import { paceSet, vdotFromRace, SUB3_VDOT, VDOT_MIN, VDOT_MAX } from "../lib/vdot.js";
+import { paceSet, vdotFromRace, estimateVdotFromLogs, SUB3_VDOT, VDOT_MIN, VDOT_MAX } from "../lib/vdot.js";
 import { parseActivityFile } from "../lib/parseActivity.js";
 import { unzip, gunzipText } from "../lib/unzip.js";
+import { loadSeries, formState, acwr, acwrState } from "../lib/load.js";
 
 // ── UI専用の能力値メタ（ロジックには影響しない）──
 const ATTRS = [
@@ -179,12 +181,19 @@ export default function TrainingApp() {
     );
   }
 
-  // ── 全mutationの中心：logs/missions/maxHR から xp・stats・ミッション自動判定を再計算 ──
+  // ── 全mutationの中心：logs/missions/maxHR から xp・stats・ミッション自動判定・VDOTを再計算 ──
   function withRecalc(base) {
     const logs = (base.logs || []).map((l) => ({ ...l, xp: calcXP(l, base.maxHR || 198) }));
     const missions = evaluateMissions(base.missions || [], logs);
     const stats = recomputeStats(logs, missions);
-    return { ...base, logs, missions, stats };
+    // 自動VDOT：オフ(autoVdot===false)でなければ、直近の練習ログから推定して更新。
+    // 手動更新（レース入力/設定での変更）をした場合は autoVdot=false でその値を維持。
+    let vdot = base.vdot;
+    if (base.autoVdot !== false) {
+      const est = estimateVdotFromLogs(logs, base.maxHR || 198);
+      if (est && est.vdot) vdot = est.vdot;
+    }
+    return { ...base, logs, missions, stats, vdot };
   }
   function commit(base) {
     saveState(withRecalc(base));
@@ -333,12 +342,22 @@ export default function TrainingApp() {
   function updateSettings(patch) {
     const next = { ...state, ...patch };
     if (patch.maxHR != null) next.maxHR = Math.max(120, Math.min(230, +patch.maxHR || 198));
-    if (patch.vdot != null) next.vdot = Math.max(VDOT_MIN, Math.min(VDOT_MAX, Math.round(+patch.vdot)));
+    if (patch.vdot != null) {
+      const v = Math.max(VDOT_MIN, Math.min(VDOT_MAX, Math.round(+patch.vdot)));
+      next.vdot = v;
+      if (v !== state.vdot) next.autoVdot = false; // 手動でVDOTを変えたら自動を停止
+    }
     commit(next); // maxHR変更時はxp・statsも再計算される
   }
 
+  // レース結果からの手動更新：自動を止めてその値を維持
   function updateVdot(v) {
-    saveState({ ...state, vdot: Math.max(VDOT_MIN, Math.min(VDOT_MAX, Math.round(v)) ) });
+    saveState({ ...state, autoVdot: false, vdot: Math.max(VDOT_MIN, Math.min(VDOT_MAX, Math.round(v))) });
+  }
+
+  // 自動VDOTのON/OFF。ONにした瞬間に直近ログから再推定。
+  function setAutoVdot(on) {
+    commit({ ...state, autoVdot: on });
   }
 
   function resetAll() {
@@ -426,7 +445,7 @@ export default function TrainingApp() {
             onRemoveMission={removeMission}
           />
         )}
-        {tab === "pace" && <PaceTab state={state} onUpdateVdot={updateVdot} />}
+        {tab === "pace" && <PaceTab state={state} onUpdateVdot={updateVdot} onSetAutoVdot={setAutoVdot} />}
         {tab === "settings" && (
           <SettingsTab state={state} onUpdate={updateSettings} onExport={exportBackup} onImport={importBackup} onResetAll={resetAll} />
         )}
@@ -478,6 +497,16 @@ function StatusTab({ state, totals }) {
     return Math.round(ms / 86400000);
   }, [state.raceDate]);
 
+  // コンディション（負荷管理：体力CTL / 疲労ATL / 調子TSB / ACWR）
+  const cond = useMemo(() => {
+    const ls = loadSeries(state.logs || [], state.maxHR || 198, { days: 42 });
+    const fs = formState(ls.tsb);
+    const aw = acwr(state.logs || [], state.maxHR || 198);
+    const aws = acwrState(aw.ratio);
+    const chart = ls.series.map((d) => ({ label: d.date.slice(5), ctl: d.ctl, atl: d.atl }));
+    return { ls, fs, aw, aws, chart };
+  }, [state.logs, state.maxHR]);
+
   // 週間距離（直近10週）と 週間XP
   const trend = useMemo(() => {
     const byWeek = {};
@@ -520,6 +549,54 @@ function StatusTab({ state, totals }) {
           </div>
         </div>
       </div>
+
+      {/* コンディション（負荷管理） */}
+      {(() => {
+        const tone = { fresh: "#22d3ee", good: "#34d399", build: "#fbbf24", warn: "#fb7185", low: "#94a3b8", none: "#94a3b8" };
+        const c = cond;
+        return (
+          <div className={card}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <BatteryCharging className="h-4 w-4 text-cyan-400" />
+                <p className="text-sm font-medium">コンディション</p>
+              </div>
+              <span className="rounded-lg px-2 py-0.5 text-[11px] font-medium" style={{ background: `${tone[c.fs.tone]}22`, color: tone[c.fs.tone] }}>
+                {c.fs.label}
+              </span>
+            </div>
+            <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+              <CondCell k="体力 CTL" v={c.ls.ctl} color="#34d399" />
+              <CondCell k="疲労 ATL" v={c.ls.atl} color="#fb7185" />
+              <CondCell k="調子 TSB" v={c.ls.tsb > 0 ? `+${c.ls.tsb}` : c.ls.tsb} color={tone[c.fs.tone]} />
+            </div>
+            {c.chart.length > 1 && (
+              <div className="mt-3 h-28">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={c.chart} margin={{ top: 5, right: 5, left: -22, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" vertical={false} />
+                    <XAxis dataKey="label" tick={{ fill: "rgba(255,255,255,0.45)", fontSize: 9 }} interval="preserveEnd" minTickGap={20} />
+                    <YAxis tick={{ fill: "rgba(255,255,255,0.45)", fontSize: 9 }} />
+                    <Tooltip
+                      contentStyle={{ background: "#11161f", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, fontSize: 12 }}
+                      labelStyle={{ color: "#fff" }}
+                    />
+                    <Line type="monotone" dataKey="ctl" name="体力" stroke="#34d399" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="atl" name="疲労" stroke="#fb7185" strokeWidth={1.5} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+            <p className="mt-2 text-[11px] text-white/60">{c.fs.detail}</p>
+            <div className="mt-2 flex items-center justify-between rounded-lg bg-white/[0.03] px-3 py-2">
+              <span className="text-[11px] text-white/50">負荷バランス（ACWR）</span>
+              <span className="text-xs font-medium" style={{ color: tone[c.aws.tone] }}>
+                {c.aw.ratio ? c.aw.ratio.toFixed(2) : "—"} ・ {c.aws.label}
+              </span>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* レースカウントダウン */}
       {state.raceDate && (
@@ -811,6 +888,15 @@ function Cell({ k, v }) {
   );
 }
 
+function CondCell({ k, v, color }) {
+  return (
+    <div className="rounded-lg bg-white/[0.03] py-2">
+      <div className="text-[10px] text-white/40">{k}</div>
+      <div className="text-lg font-black tabular-nums" style={{ color }}>{v}</div>
+    </div>
+  );
+}
+
 // ── ミッション（既定は今週のログから自動判定 / カスタムは手動）──
 function MissionsTab({ state, onToggle, onReEvaluate, onAddMission, onRemoveMission }) {
   const missions = state.missions || [];
@@ -918,9 +1004,11 @@ function MissionsTab({ state, onToggle, onReEvaluate, onAddMission, onRemoveMiss
 }
 
 // ── ペース（VDOT・公式換算表）──
-function PaceTab({ state, onUpdateVdot }) {
+function PaceTab({ state, onUpdateVdot, onSetAutoVdot }) {
   const P = paceSet(state.vdot);
   const gap = SUB3_VDOT - state.vdot;
+  const autoOn = state.autoVdot !== false;
+  const est = useMemo(() => estimateVdotFromLogs(state.logs || [], state.maxHR || 198), [state.logs, state.maxHR]);
 
   const RACES = [
     { key: "5000", label: "5km", m: 5000 },
@@ -970,6 +1058,52 @@ function PaceTab({ state, onUpdateVdot }) {
           <RaceCell k="5km" v={P.race.fiveK} />
         </div>
         <p className="mt-2 text-[10px] text-white/40">現VDOTでのレース予想タイム（公式換算表より）</p>
+      </div>
+
+      {/* 自動VDOT（日々の練習タイム・心拍から推定） */}
+      <div className={card}>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Sparkles className="h-4 w-4 text-cyan-400" />
+            <p className="text-sm font-medium">自動VDOT更新</p>
+          </div>
+          <button
+            onClick={() => onSetAutoVdot(!autoOn)}
+            className={`${btn} px-3 py-1 text-xs ${autoOn ? "bg-emerald-500/20 text-emerald-300" : "border border-white/15 bg-white/5 text-white/60"}`}
+          >
+            {autoOn ? "自動：ON" : "自動：OFF"}
+          </button>
+        </div>
+        {est ? (
+          <>
+            <div className="mt-3 flex items-end justify-between">
+              <div>
+                <p className="text-[11px] text-white/50">直近90日の推定VDOT</p>
+                <p className="text-3xl font-black leading-none text-cyan-300">{est.vdot}</p>
+              </div>
+              <p className="text-[11px] text-white/40">{est.samples}本から（採用 {est.used}本）</p>
+            </div>
+            {autoOn ? (
+              <p className="mt-2 text-[11px] text-emerald-300/80">
+                現在のVDOTは練習ログから自動更新されています（記録を追加・取込するたびに再計算）。
+              </p>
+            ) : (
+              <button
+                onClick={() => onSetAutoVdot(true)}
+                className={`${btn} mt-3 w-full bg-cyan-500/90 text-black hover:bg-cyan-400`}
+              >
+                推定VDOT {est.vdot} を適用して自動更新をONにする
+              </button>
+            )}
+          </>
+        ) : (
+          <p className="mt-3 text-[11px] text-white/50">
+            推定に使える連続走（5km〜・15分以上・心拍あり、平坦）がまだありません。ランを記録/取込すると自動でVDOTが更新されます。
+          </p>
+        )}
+        <p className="mt-2 text-[10px] text-white/40">
+          ペース×心拍から%VO2maxを推定して算出。地形(登坂/下り)・超長時間(180分超のウルトラ)は精度のため除外。レース結果は最優先で反映。表示ペースは常に公式換算表の値です。
+        </p>
       </div>
 
       {/* 今週の練習方針（VDOT差から） */}
@@ -1042,7 +1176,7 @@ function PaceTab({ state, onUpdateVdot }) {
           </button>
         </div>
         <p className="mt-2 text-[10px] text-white/40">
-          ※ 利尻53km等のウルトラは超低強度でVDOT算出に不向きです。直近の5km〜ハーフ、またはTT（タイムトライアル）で更新してください。デフォルトはVDOT50。
+          ※ 利尻53km等のウルトラは超低強度でVDOT算出に不向きです。直近の5km〜ハーフ、またはTT（タイムトライアル）で更新してください。手動更新すると自動VDOTは一旦OFFになります（上のトグルで再開可）。
         </p>
       </div>
 
