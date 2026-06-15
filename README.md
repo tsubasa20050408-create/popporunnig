@@ -17,8 +17,19 @@
 7. **心拍ゾーン**（maxHR基準のZ1〜Z5）
 8. **自動VDOT更新** — 日々の練習タイム・心拍から自分のVDOTを自動推定して更新（`lib/vdot.js`）
 9. **コンディション（負荷管理）** — 体力CTL / 疲労ATL / 調子TSB / 負荷バランスACWR（`lib/load.js`）
+10. **自己ベスト(PB)＋走力(VDOT)推移**（`lib/vdot.js`） — 距離別ベスト自動抽出と走力の時系列グラフ
+11. **練習プラン自動生成**（`lib/plan.js`） — 現VDOT＋レース日＋週回数 から E/M/T/I/R 週次メニューを逆算
+12. **故障予防アラート**（`lib/load.js`） — 単調度Monotony・ACWR・TSB から過負荷/単調/疲労を警告
+13. **シューズ管理**（`lib/gear.js`） — 記録にシューズを紐付け走行距離を積算・寿命アラート
+14. **ヘルスデータ記録**（`lib/health.js`） — 体重・安静時心拍・睡眠・主観疲労(RPE)。安静時心拍上昇で体調アラート
 
 > 派生値（XP・能力値・ミッション達成・VDOT）はすべて `logs`/`missions`/`maxHR` から `recomputeStats`・`evaluateMissions`・`estimateVdotFromLogs` で再計算するため、編集・削除しても整合します。
+
+### 10〜14（GitHubのランニングOSSを参照して追加）
+- **自己ベスト/走力推移**（statistics-for-strava / Runalyze 参照） — `personalBests` は各距離帯(5/10/half/full)で最速の実走を抽出。`vdotTrend` は各ランのVDOT推定を時系列化。
+- **練習プラン**（RunCulator / Daniels plan 参照） — `weeklyPlan({vdot, raceDate, daysPerWeek})`。レースまでの週数で土台/ビルド/仕上げ/テーパーに周期化。ペースは公式換算表の値。
+- **故障予防**（Runalyze 参照） — `monotony`＝平均/(標準偏差+平均)、`trainingAlerts` が ACWR>1.5・Monotony≥0.8・TSB≤−15 を警告。
+- **シューズ管理 / ヘルスデータ**（Endurain 参照） — ギアは `gearId` でログに紐付け、`gearMileage`/`gearAlerts` で寿命管理。ヘルスは `health[]` に体重/安静時心拍/睡眠/RPEを記録、`healthAlerts` が安静時心拍の上昇を検知。
 
 ### 8. 自動VDOT更新（`lib/vdot.js`）
 - 直近90日の練習ログから、ペース×心拍で**自分のVDOTを自動推定**（ペース→走速の酸素コスト、心拍→%VO2max を求めて逆算）。

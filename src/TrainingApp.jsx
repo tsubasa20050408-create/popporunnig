@@ -7,7 +7,7 @@ import {
   Activity, Trophy, Target, Gauge, Flame, Mountain, TrendingDown,
   Heart, RefreshCw, Link2, Plus, RotateCcw, ChevronRight,
   Settings, Trash2, Download, Upload, Calendar, Dumbbell, HeartPulse, Pencil, X,
-  BatteryCharging, Sparkles,
+  BatteryCharging, Sparkles, Footprints, AlertTriangle, Award, CalendarDays, Moon, Scale,
 } from "lucide-react";
 import {
   WORKOUTS, SEED_STATS, SEED_LOGS, SEED_MISSIONS,
@@ -15,10 +15,13 @@ import {
   recomputeStats, evaluateMissions, weekRange, hrZones, weeklyFocus, STRENGTH_PLAN,
   initialState,
 } from "../lib/training.js";
-import { paceSet, vdotFromRace, estimateVdotFromLogs, SUB3_VDOT, VDOT_MIN, VDOT_MAX } from "../lib/vdot.js";
+import { paceSet, vdotFromRace, estimateVdotFromLogs, vdotTrend, personalBests, SUB3_VDOT, VDOT_MIN, VDOT_MAX } from "../lib/vdot.js";
 import { parseActivityFile } from "../lib/parseActivity.js";
 import { unzip, gunzipText } from "../lib/unzip.js";
-import { loadSeries, formState, acwr, acwrState } from "../lib/load.js";
+import { loadSeries, formState, acwr, acwrState, trainingAlerts } from "../lib/load.js";
+import { weeklyPlan } from "../lib/plan.js";
+import { gearMileage, gearAlerts } from "../lib/gear.js";
+import { healthAlerts, latestHealth } from "../lib/health.js";
 
 // ── UI専用の能力値メタ（ロジックには影響しない）──
 const ATTRS = [
@@ -211,10 +214,44 @@ export default function TrainingApp() {
       maxHR: +form.maxHR || 0,
       gain: +form.gain || 0,
       descent: 0,
+      gearId: form.gearId || "",
       note: form.note || "",
     };
     commit({ ...state, logs: [log, ...state.logs] });
     setTab("status");
+  }
+
+  // ── ギア（シューズ）──
+  function addGear(g) {
+    const gear = {
+      id: "g_" + Date.now(),
+      name: g.name || "シューズ",
+      initialKm: +g.initialKm || 0,
+      retireKm: +g.retireKm || 600,
+    };
+    commit({ ...state, gear: [...(state.gear || []), gear] });
+  }
+  function removeGear(id) {
+    commit({ ...state, gear: (state.gear || []).filter((g) => g.id !== id) });
+  }
+
+  // ── ヘルスデータ（体重・安静時心拍・睡眠・RPE）──
+  function addHealth(h) {
+    const entry = {
+      id: "h_" + Date.now(),
+      date: h.date,
+      weight: +h.weight || 0,
+      rhr: +h.rhr || 0,
+      sleep: +h.sleep || 0,
+      rpe: +h.rpe || 0,
+      note: h.note || "",
+    };
+    // 同日があれば置き換え
+    const rest = (state.health || []).filter((x) => x.date !== entry.date);
+    commit({ ...state, health: [...rest, entry] });
+  }
+  function removeHealth(id) {
+    commit({ ...state, health: (state.health || []).filter((h) => h.id !== id) });
   }
 
   // ── GPX/TCX/ZIP/gz ファイル取込（Strava API不要・完全無料）──
@@ -432,7 +469,7 @@ export default function TrainingApp() {
         )}
 
         {tab === "status" && <StatusTab state={state} totals={totals} />}
-        {tab === "log" && <LogTab onAdd={addLog} onImport={importFiles} />}
+        {tab === "log" && <LogTab state={state} onAdd={addLog} onImport={importFiles} onAddHealth={addHealth} />}
         {tab === "history" && (
           <HistoryTab state={state} onChangeType={changeLogType} onEdit={editLog} onDelete={deleteLog} />
         )}
@@ -445,9 +482,20 @@ export default function TrainingApp() {
             onRemoveMission={removeMission}
           />
         )}
-        {tab === "pace" && <PaceTab state={state} onUpdateVdot={updateVdot} onSetAutoVdot={setAutoVdot} />}
+        {tab === "pace" && (
+          <PaceTab state={state} onUpdateVdot={updateVdot} onSetAutoVdot={setAutoVdot} onSetDays={(d) => updateSettings({ daysPerWeek: d })} />
+        )}
         {tab === "settings" && (
-          <SettingsTab state={state} onUpdate={updateSettings} onExport={exportBackup} onImport={importBackup} onResetAll={resetAll} />
+          <SettingsTab
+            state={state}
+            onUpdate={updateSettings}
+            onExport={exportBackup}
+            onImport={importBackup}
+            onResetAll={resetAll}
+            onAddGear={addGear}
+            onRemoveGear={removeGear}
+            onRemoveHealth={removeHealth}
+          />
         )}
       </div>
 
@@ -475,6 +523,18 @@ export default function TrainingApp() {
   );
 }
 
+// 分(小数可) → H:MM:SS / M:SS
+function fmtTime(min) {
+  if (!min || min <= 0) return "—";
+  const total = Math.round(min * 60);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${m}:${String(s).padStart(2, "0")}`;
+}
+
 // 日付文字列(YYYY-MM-DD)の週始まり(月曜)を返す
 function mondayOf(dateStr) {
   const d = new Date(dateStr + "T00:00:00");
@@ -496,6 +556,20 @@ function StatusTab({ state, totals }) {
     const ms = new Date(state.raceDate + "T00:00:00") - new Date(new Date().toISOString().slice(0, 10) + "T00:00:00");
     return Math.round(ms / 86400000);
   }, [state.raceDate]);
+
+  // 故障予防アラート（負荷／ギア寿命／体調）
+  const alerts = useMemo(() => [
+    ...trainingAlerts(state.logs || [], state.maxHR || 198),
+    ...gearAlerts(state.gear || [], state.logs || []),
+    ...healthAlerts(state.health || []),
+  ], [state.logs, state.maxHR, state.gear, state.health]);
+
+  // 自己ベスト（距離別）と 走力(VDOT)推移
+  const pbs = useMemo(() => personalBests(state.logs || []), [state.logs]);
+  const vTrend = useMemo(
+    () => vdotTrend(state.logs || [], state.maxHR || 198).map((p) => ({ ...p, label: p.date.slice(5) })),
+    [state.logs, state.maxHR]
+  );
 
   // コンディション（負荷管理：体力CTL / 疲労ATL / 調子TSB / ACWR）
   const cond = useMemo(() => {
@@ -526,6 +600,23 @@ function StatusTab({ state, totals }) {
 
   return (
     <div className="space-y-4">
+      {/* 故障予防アラート */}
+      {alerts.length > 0 && (
+        <div className="space-y-2">
+          {alerts.map((a, i) => (
+            <div
+              key={i}
+              className={`flex items-start gap-2 rounded-xl px-3 py-2 text-[12px] ${
+                a.level === "warn" ? "bg-rose-500/15 text-rose-200" : "bg-amber-500/15 text-amber-200"
+              }`}
+            >
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{a.msg}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* レベルカード */}
       <div className={card}>
         <div className="flex items-end justify-between">
@@ -667,6 +758,58 @@ function StatusTab({ state, totals }) {
         </div>
       </div>
 
+      {/* 自己ベスト（距離別） */}
+      <div className={card}>
+        <div className="mb-2 flex items-center gap-2">
+          <Award className="h-4 w-4 text-yellow-400" />
+          <p className="text-sm font-medium">自己ベスト（距離別）</p>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          {pbs.map((p) => (
+            <div key={p.key} className="rounded-xl bg-white/[0.03] px-3 py-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-white/60">{p.label}</span>
+                {p.best && <span className="text-[10px] text-white/35">{p.best.date.slice(5)}</span>}
+              </div>
+              {p.best ? (
+                <>
+                  <p className="font-mono text-base font-bold tabular-nums text-yellow-300">{fmtTime(p.best.dur)}</p>
+                  <p className="text-[10px] text-white/40">{p.best.dist}km ・ {fmtPace(p.best.dur, p.best.dist)}/km</p>
+                </>
+              ) : (
+                <p className="mt-1 text-sm text-white/30">—</p>
+              )}
+            </div>
+          ))}
+        </div>
+        <p className="mt-2 text-[10px] text-white/40">記録した活動のうち各距離帯で最速のもの。レース/TTを記録すると更新されます。</p>
+      </div>
+
+      {/* 走力（VDOT）推移 */}
+      {vTrend.length > 1 && (
+        <div className={card}>
+          <div className="mb-2 flex items-center gap-2">
+            <Sparkles className="h-4 w-4 text-cyan-400" />
+            <p className="text-sm font-medium">走力（VDOT）推移</p>
+          </div>
+          <div className="h-36">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={vTrend} margin={{ top: 5, right: 5, left: -22, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" vertical={false} />
+                <XAxis dataKey="label" tick={{ fill: "rgba(255,255,255,0.45)", fontSize: 9 }} interval="preserveEnd" minTickGap={20} />
+                <YAxis domain={["dataMin - 2", "dataMax + 2"]} tick={{ fill: "rgba(255,255,255,0.45)", fontSize: 9 }} />
+                <Tooltip
+                  contentStyle={{ background: "#11161f", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, fontSize: 12 }}
+                  labelStyle={{ color: "#fff" }} formatter={(v) => [v, "推定VDOT"]}
+                />
+                <Line type="monotone" dataKey="vdot" stroke="#22d3ee" strokeWidth={2} dot={{ r: 2, fill: "#22d3ee" }} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="mt-2 text-[10px] text-white/40">各ランのペース×心拍から推定した走力。右肩上がりなら成長中。</p>
+        </div>
+      )}
+
       {/* 推移グラフ */}
       <div className={card}>
         <div className="flex items-center justify-between">
@@ -709,10 +852,11 @@ function StatusTab({ state, totals }) {
 }
 
 // ── 記録 ──
-function LogTab({ onAdd, onImport }) {
+function LogTab({ state, onAdd, onImport, onAddHealth }) {
   const today = new Date().toISOString().slice(0, 10);
+  const gear = state.gear || [];
   const [form, setForm] = useState({
-    date: today, type: "easy", dist: "", dur: "", avgHR: "", maxHR: "", gain: "", note: "",
+    date: today, type: "easy", dist: "", dur: "", avgHR: "", maxHR: "", gain: "", gearId: "", note: "",
   });
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
   const input = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-emerald-400/60";
@@ -767,6 +911,15 @@ function LogTab({ onAdd, onImport }) {
             <Field label="平均HR"><input type="number" inputMode="numeric" className={input} value={form.avgHR} onChange={set("avgHR")} placeholder="150" /></Field>
             <Field label="最大HR"><input type="number" inputMode="numeric" className={input} value={form.maxHR} onChange={set("maxHR")} placeholder="175" /></Field>
           </div>
+          {gear.length > 0 && (
+            <div>
+              <label className="mb-1 block text-[11px] text-white/50">シューズ</label>
+              <select className={input} value={form.gearId} onChange={set("gearId")}>
+                <option value="">（未指定）</option>
+                {gear.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+              </select>
+            </div>
+          )}
           <Field label="メモ"><input className={input} value={form.note} onChange={set("note")} placeholder="今日の感触など" /></Field>
 
           <div className="flex items-center justify-between rounded-xl bg-emerald-500/10 px-3 py-2 text-sm">
@@ -779,6 +932,43 @@ function LogTab({ onAdd, onImport }) {
           </button>
         </div>
       </div>
+
+      <HealthEntry onAddHealth={onAddHealth} latest={latestHealth(state.health)} />
+    </div>
+  );
+}
+
+// ── コンディション記録（体重・安静時心拍・睡眠・主観疲労）──
+function HealthEntry({ onAddHealth, latest }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const [h, setH] = useState({ date: today, weight: "", rhr: "", sleep: "", rpe: "" });
+  const set = (k) => (e) => setH((p) => ({ ...p, [k]: e.target.value }));
+  const input = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-emerald-400/60";
+  const hasInput = h.weight || h.rhr || h.sleep || h.rpe;
+  return (
+    <div className={card}>
+      <div className="mb-1 flex items-center gap-2">
+        <HeartPulse className="h-4 w-4 text-rose-400" />
+        <p className="text-sm font-medium">コンディション記録</p>
+      </div>
+      <p className="mb-3 text-[11px] text-white/40">
+        体重・安静時心拍・睡眠・主観疲労(RPE)。安静時心拍が平常より高いと故障/不調アラートが出ます。
+        {latest && <span className="text-white/30">（前回 {latest.date.slice(5)}）</span>}
+      </p>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="日付"><input type="date" className={input} value={h.date} onChange={set("date")} /></Field>
+        <Field label="体重 (kg)"><input type="number" inputMode="decimal" className={input} value={h.weight} onChange={set("weight")} placeholder="61.5" /></Field>
+        <Field label="安静時心拍"><input type="number" inputMode="numeric" className={input} value={h.rhr} onChange={set("rhr")} placeholder="48" /></Field>
+        <Field label="睡眠 (時間)"><input type="number" inputMode="decimal" className={input} value={h.sleep} onChange={set("sleep")} placeholder="7.5" /></Field>
+        <Field label="主観疲労 RPE (1-10)"><input type="number" inputMode="numeric" className={input} value={h.rpe} onChange={set("rpe")} placeholder="5" /></Field>
+      </div>
+      <button
+        onClick={() => { if (hasInput) { onAddHealth(h); setH({ date: today, weight: "", rhr: "", sleep: "", rpe: "" }); } }}
+        disabled={!hasInput}
+        className={`${btn} mt-3 w-full bg-rose-500/90 text-white hover:bg-rose-500`}
+      >
+        コンディションを記録
+      </button>
     </div>
   );
 }
@@ -795,6 +985,7 @@ function Field({ label, children }) {
 // ── 履歴（種別修正・編集・削除）──
 function HistoryTab({ state, onChangeType, onEdit, onDelete }) {
   const logs = state.logs || [];
+  const gear = state.gear || [];
   const [editId, setEditId] = useState(null);
   return (
     <div className="space-y-3">
@@ -804,6 +995,7 @@ function HistoryTab({ state, onChangeType, onEdit, onDelete }) {
           <LogEditor
             key={l.id}
             log={l}
+            gear={gear}
             onCancel={() => setEditId(null)}
             onSave={(patch) => { onEdit(l.id, patch); setEditId(null); }}
           />
@@ -852,10 +1044,10 @@ function HistoryTab({ state, onChangeType, onEdit, onDelete }) {
   );
 }
 
-function LogEditor({ log, onSave, onCancel }) {
+function LogEditor({ log, gear = [], onSave, onCancel }) {
   const [f, setF] = useState({
     date: log.date || "", dist: log.dist ?? "", dur: log.dur ?? "",
-    gain: log.gain ?? "", avgHR: log.avgHR ?? "", maxHR: log.maxHR ?? "", note: log.note || "",
+    gain: log.gain ?? "", avgHR: log.avgHR ?? "", maxHR: log.maxHR ?? "", gearId: log.gearId || "", note: log.note || "",
   });
   const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
   const input = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-emerald-400/60";
@@ -870,6 +1062,14 @@ function LogEditor({ log, onSave, onCancel }) {
         <Field label="平均HR"><input type="number" inputMode="numeric" className={input} value={f.avgHR} onChange={set("avgHR")} /></Field>
         <Field label="最大HR"><input type="number" inputMode="numeric" className={input} value={f.maxHR} onChange={set("maxHR")} /></Field>
       </div>
+      {gear.length > 0 && (
+        <Field label="シューズ">
+          <select className={input} value={f.gearId} onChange={set("gearId")}>
+            <option value="">（未指定）</option>
+            {gear.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+          </select>
+        </Field>
+      )}
       <Field label="メモ"><input className={input} value={f.note} onChange={set("note")} /></Field>
       <div className="mt-3 flex gap-2">
         <button onClick={() => onSave(f)} className={`${btn} flex-1 bg-emerald-500 text-black hover:bg-emerald-400`}>保存</button>
@@ -1132,6 +1332,49 @@ function PaceTab({ state, onUpdateVdot, onSetAutoVdot }) {
         );
       })()}
 
+      {/* 週次トレーニングプラン自動生成 */}
+      {(() => {
+        const days = state.daysPerWeek || 4;
+        const plan = weeklyPlan({ vdot: state.vdot, raceDate: state.raceDate, daysPerWeek: days });
+        const typeColor = {
+          rest: "text-white/40", easy: "text-emerald-300", long: "text-blue-300",
+          tempo: "text-amber-300", interval: "text-pink-300",
+        };
+        return (
+          <div className={card}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <CalendarDays className="h-4 w-4 text-emerald-400" />
+                <p className="text-sm font-medium">今週のプラン</p>
+              </div>
+              <select
+                className="rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-xs outline-none focus:border-emerald-400/60"
+                value={days}
+                onChange={(e) => onSetDays(+e.target.value)}
+              >
+                {[3, 4, 5, 6, 7].map((n) => <option key={n} value={n}>週{n}回</option>)}
+              </select>
+            </div>
+            <p className="mt-1 text-[11px] text-cyan-300">
+              {plan.phase.label}{plan.weeksToRace != null ? `（レースまで${plan.weeksToRace}週）` : ""}
+            </p>
+            <div className="mt-2 space-y-1">
+              {plan.days.map((d, i) => (
+                <div key={i} className="flex items-center gap-3 rounded-lg bg-white/[0.03] px-3 py-1.5">
+                  <span className="w-5 shrink-0 text-center text-xs font-bold text-white/50">{d.dow}</span>
+                  <div className="min-w-0 flex-1">
+                    <p className={`truncate text-xs font-medium ${typeColor[d.type] || "text-white/80"}`}>{d.label}</p>
+                    <p className="truncate text-[10px] text-white/40">{d.detail}</p>
+                  </div>
+                  <span className="shrink-0 font-mono text-[11px] tabular-nums text-white/70">{d.pace}</span>
+                </div>
+              ))}
+            </div>
+            <p className="mt-2 text-[10px] text-white/40">現VDOTとレース日から自動生成（ダニエルズ式）。ペースは公式換算表の値。曜日は目安です。</p>
+          </div>
+        );
+      })()}
+
       {/* 練習ペース表 */}
       <div className={card}>
         <p className="mb-2 text-sm font-medium">練習ペース（/km）</p>
@@ -1213,7 +1456,7 @@ function RaceCell({ k, v }) {
 }
 
 // ── 設定 ──
-function SettingsTab({ state, onUpdate, onExport, onImport, onResetAll }) {
+function SettingsTab({ state, onUpdate, onExport, onImport, onResetAll, onAddGear, onRemoveGear, onRemoveHealth }) {
   const [f, setF] = useState({
     maxHR: state.maxHR ?? 198,
     vdot: state.vdot ?? 50,
@@ -1222,6 +1465,9 @@ function SettingsTab({ state, onUpdate, onExport, onImport, onResetAll }) {
   });
   const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
   const input = "w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-emerald-400/60";
+  const mileage = gearMileage(state.gear || [], state.logs || []);
+  const health = [...(state.health || [])].sort((a, b) => (b.date || "").localeCompare(a.date || "")).slice(0, 8);
+  const [gearForm, setGearForm] = useState({ name: "", initialKm: "", retireKm: "600" });
 
   return (
     <div className="space-y-4">
@@ -1260,6 +1506,74 @@ function SettingsTab({ state, onUpdate, onExport, onImport, onResetAll }) {
           </label>
         </div>
       </div>
+
+      {/* ギア（シューズ）管理 */}
+      <div className={card}>
+        <div className="mb-1 flex items-center gap-2">
+          <Footprints className="h-4 w-4 text-emerald-400" />
+          <p className="text-sm font-medium">シューズ管理</p>
+        </div>
+        <p className="mb-3 text-[11px] text-white/40">記録時にシューズを選ぶと走行距離が積算され、寿命が近づくとアラートします。</p>
+        <div className="space-y-2">
+          {mileage.map((g) => (
+            <div key={g.id} className="rounded-xl bg-white/[0.03] px-3 py-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">{g.name}</span>
+                <div className="flex items-center gap-2">
+                  <span className={`text-xs tabular-nums ${g.over ? "text-rose-300" : g.warn ? "text-amber-300" : "text-white/60"}`}>
+                    {g.km} / {g.retireKm}km
+                  </span>
+                  <button onClick={() => onRemoveGear(g.id)} className="text-rose-300/70 hover:text-rose-300" aria-label="削除">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+              <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/10">
+                <div className={`h-full rounded-full ${g.over ? "bg-rose-400" : g.warn ? "bg-amber-400" : "bg-emerald-400"}`} style={{ width: `${g.pct}%` }} />
+              </div>
+            </div>
+          ))}
+          {mileage.length === 0 && <p className="text-[11px] text-white/30">まだシューズが登録されていません。</p>}
+        </div>
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          <div className="col-span-3"><input className={input} value={gearForm.name} onChange={(e) => setGearForm((p) => ({ ...p, name: e.target.value }))} placeholder="シューズ名（例: Vaporfly 3）" /></div>
+          <Field label="初期km"><input type="number" inputMode="numeric" className={input} value={gearForm.initialKm} onChange={(e) => setGearForm((p) => ({ ...p, initialKm: e.target.value }))} placeholder="0" /></Field>
+          <Field label="寿命km"><input type="number" inputMode="numeric" className={input} value={gearForm.retireKm} onChange={(e) => setGearForm((p) => ({ ...p, retireKm: e.target.value }))} /></Field>
+          <div className="flex items-end">
+            <button
+              onClick={() => { if (gearForm.name.trim()) { onAddGear(gearForm); setGearForm({ name: "", initialKm: "", retireKm: "600" }); } }}
+              className={`${btn} w-full bg-emerald-500 text-black hover:bg-emerald-400`}
+            >追加</button>
+          </div>
+        </div>
+      </div>
+
+      {/* コンディション履歴 */}
+      {health.length > 0 && (
+        <div className={card}>
+          <div className="mb-2 flex items-center gap-2">
+            <HeartPulse className="h-4 w-4 text-rose-400" />
+            <p className="text-sm font-medium">コンディション履歴</p>
+          </div>
+          <div className="space-y-1">
+            {health.map((h) => (
+              <div key={h.id} className="flex items-center gap-2 rounded-lg bg-white/[0.03] px-3 py-1.5 text-[11px]">
+                <span className="w-12 shrink-0 text-white/50">{h.date.slice(5)}</span>
+                <span className="flex flex-1 flex-wrap gap-x-3 text-white/70">
+                  {h.weight ? <span className="flex items-center gap-1"><Scale className="h-3 w-3" />{h.weight}kg</span> : null}
+                  {h.rhr ? <span className="flex items-center gap-1"><HeartPulse className="h-3 w-3" />{h.rhr}</span> : null}
+                  {h.sleep ? <span className="flex items-center gap-1"><Moon className="h-3 w-3" />{h.sleep}h</span> : null}
+                  {h.rpe ? <span>RPE {h.rpe}</span> : null}
+                </span>
+                <button onClick={() => onRemoveHealth(h.id)} className="text-rose-300/60 hover:text-rose-300" aria-label="削除">
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+          <p className="mt-2 text-[10px] text-white/40">コンディションは「記録」タブの下部から入力できます。</p>
+        </div>
+      )}
 
       <div className={card}>
         <p className="mb-3 text-sm font-medium text-rose-300">危険な操作</p>
